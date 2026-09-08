@@ -7,6 +7,15 @@ const VALID_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/u
 const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
 
 /**
+ * A host is an RFC 3986 IP-literal only when the whole host is bracketed and
+ * carries no further bracket inside it. A bracket anywhere else means the host
+ * is not an IP-literal and must never be handled as one.
+ *
+ * @type {(value: string) => boolean}
+ */
+const isIPLiteral = RegExp.prototype.test.bind(/^\[[^[\]]*\]$/u)
+
+/**
  * Decode a scheme once and require it to stay a valid RFC 3986 scheme. Rejects
  * a scheme that decodes into reserved delimiters (e.g. "%2f%2f").
  *
@@ -419,10 +428,11 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
-        const bracketedIPLiteral = parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']'
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
+        const hasIPLiteralBracket = parsed.host.indexOf('[') !== -1 || parsed.host.indexOf(']') !== -1
         const ipv6result = normalizeIPv6(parsed.host)
         isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
-        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true)
         parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
 
         if (malformedIPLiteral) {
@@ -452,7 +462,9 @@ function parseWithStatus (uri, opts) {
     const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme)
 
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
-    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    if (!malformedIPLiteral) {
+      malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    }
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (uri.indexOf('%') !== -1) {

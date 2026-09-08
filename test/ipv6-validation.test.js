@@ -90,6 +90,47 @@ test('valid IPv6, IPvFuture, embedded IPv4, and zone forms normalize safely', (t
   t.end()
 })
 
+test('hosts with unbalanced or misplaced IP-literal brackets are rejected', (t) => {
+  // A bracket anywhere in the host means the host claims to be an IP-literal.
+  // Unless it is a complete literal that also parses as IPv6/IPvFuture, it must
+  // fail closed: fast-uri's authority regex stops the userinfo at the *first*
+  // "@", so a host such as "[@127.0.0.1" is a different authority than the one
+  // Node's URL resolves (host-allowlist bypass / SSRF).
+  const malformed = [
+    'http://[fe80',
+    'http://[',
+    'http://[not-an-ip',
+    'http://[日本',
+    'http://[fe80/private',
+    'http://fe80]/private',
+    'http://user@[@127.0.0.1:8123/admin',
+    'http://user@]127.0.0.1:8123/admin',
+    'http://user@prefix[@127.0.0.1:8123/admin',
+    'http://user@prefix]@127.0.0.1:8123/admin'
+  ]
+  const modes = [
+    ['default', undefined],
+    ['Unicode', { unicodeSupport: true }]
+  ]
+
+  for (const [mode, options] of modes) {
+    for (const uri of malformed) {
+      const parsed = fastURI.parse(uri, options)
+      const message = `${mode} mode rejects ${uri}`
+
+      t.equal(parsed.error, HOST_ERROR, `parse ${message}`)
+      t.equal(fastURI.normalize(uri, options), uri, `normalize preserves ${uri} in ${mode} mode`)
+      t.equal(fastURI.equal(uri, uri, options), false, `equal ${message}`)
+      t.throws(
+        () => fastURI.resolve('http://example.com/', uri, options),
+        /URI host is malformed\./,
+        `resolve ${message}`
+      )
+    }
+  }
+  t.end()
+})
+
 test('unterminated bracket hosts are not treated as IP literals', (t) => {
   // An IP-literal is only an IP-literal when both brackets are present. A host
   // with a single bracket must keep failing the reg-name/IDN conversion instead
@@ -111,10 +152,10 @@ test('unterminated bracket hosts are not treated as IP literals', (t) => {
     t.equal(result.host, host, `${host} is not rewritten`)
   }
 
+  // These forms lose their authority before the host is examined: the parser
+  // stops the host at the first ":", so the remainder becomes a path that does
+  // not start with "/" and that error is reported first.
   const uris = [
-    'http://[fe80',
-    'http://[fe80/private',
-    'http://fe80]/private',
     'http://[2001:db8::1/private',
     'http://2001:db8::1]/private'
   ]
@@ -126,7 +167,7 @@ test('unterminated bracket hosts are not treated as IP literals', (t) => {
     t.equal(fastURI.equal(uri, uri), false, `equal rejects ${uri}`)
     t.throws(
       () => fastURI.resolve(uri, 'child'),
-      /Host's domain name can not be converted to ASCII|URI path must start with/,
+      /URI path must start with/,
       `resolve rejects ${uri}`
     )
   }
