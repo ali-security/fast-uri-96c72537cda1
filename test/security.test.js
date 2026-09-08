@@ -482,3 +482,183 @@ test('CVE-2026-75899: host conversion failures are not treated as comparable URL
     'resolve propagates a host conversion failure'
   )
 })
+
+test('CVE-2026-76172: a scheme that decodes into reserved delimiters is rejected', (t) => {
+  const malformed = [
+    '%2f%2fevil.example:/pwn',
+    '%2F%2Fevil.example:/pwn',
+    'ht%74p%2f%2fevil.example:/x'
+  ]
+
+  t.plan(malformed.length * 2)
+
+  malformed.forEach((uri) => {
+    t.equal(fastURI.parse(uri).error, 'URI scheme is malformed.', `parse rejects ${uri}`)
+    t.equal(fastURI.normalize(uri), uri, `normalize preserves the failing input ${uri}`)
+  })
+})
+
+test('CVE-2026-76172: resolve throws when a component scheme decodes into delimiters', (t) => {
+  t.plan(2)
+  t.throws(
+    () => fastURI.resolve('%2f%2fevil.example:/pwn', 'child'),
+    /URI scheme is malformed/,
+    'resolve rejects a malformed base scheme'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '%2f%2fevil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'serialize rejects a component scheme that decodes to delimiters'
+  )
+})
+
+test('CVE-2026-76172: a scheme that decodes to a valid scheme is still accepted', (t) => {
+  t.plan(2)
+  t.equal(fastURI.parse('htt%70://example.com/').scheme, 'http', 'harmless encoded scheme decodes to http')
+  t.equal(fastURI.normalize('HTTP://example.com/'), 'http://example.com/', 'scheme is lowercased')
+})
+
+test('CVE-2026-76172: a decoded scheme can not smuggle a new authority downstream', (t) => {
+  const evil = '%2f%2fevil.example:/pwn'
+
+  t.plan(4)
+
+  // Before the fix parse() unescaped the scheme in place, so normalize() emitted
+  // "//evil.example:/pwn" — a string that reparses with "evil.example" as the
+  // authority (host-allowlist bypass).
+  const normalized = fastURI.normalize(evil)
+  t.equal(normalized, evil, 'normalize does not rewrite the scheme into an authority')
+  t.notEqual(fastURI.parse(normalized).host, 'evil.example', 'the round trip never yields a new host')
+  t.equal(fastURI.equal(evil, evil, {}), false, 'equal refuses a URI whose scheme is malformed')
+  t.throws(
+    () => fastURI.resolve('https://trusted.example/', evil),
+    /URI scheme is malformed/,
+    'resolve rejects a malformed relative scheme'
+  )
+})
+
+test('CVE-2026-76172: a scheme handler can not install a malformed scheme while serializing', (t) => {
+  t.plan(1)
+
+  fastURI.SCHEMES['x-cve-2026-76172'] = {
+    scheme: 'x-cve-2026-76172',
+    parse: (component) => component,
+    serialize: (component) => {
+      component.scheme = '%2f%2fevil.example'
+      return component
+    }
+  }
+
+  try {
+    t.throws(
+      () => fastURI.serialize({ scheme: 'x-cve-2026-76172', path: '/pwn' }),
+      /URI scheme is malformed/,
+      'the scheme is revalidated after scheme specific serialization'
+    )
+  } finally {
+    delete fastURI.SCHEMES['x-cve-2026-76172']
+  }
+})
+
+// Every shape of scheme that does not survive a single decode as an RFC 3986
+// scheme: reserved delimiters ("%2f", "%3a"), the "%uXXXX" form unescape() also
+// decodes, CRLF header smuggling, characters outside the scheme grammar, and
+// the case-folding tricks (U+212A KELVIN SIGN lowercases to "k", U+017F
+// uppercases to "S") that would sneak past a validation done after folding.
+const cve202676172MalformedSchemes = [
+  '%2f%2fevil.example:/pwn',
+  '%u002f%u002fevil.example:/pwn',
+  '%0d%0aSet-Cookie:%20sid=attacker:/p',
+  'foo%3Abar:value',
+  'foo%2Fbar:value',
+  '1http://example.com/',
+  'foo_bar:value',
+  'éxample:value',
+  'Kttp://example.com/',
+  'ſcheme:value'
+]
+
+test('CVE-2026-76172: every scheme that decodes to an invalid scheme fails closed', (t) => {
+  t.plan(cve202676172MalformedSchemes.length * 3)
+
+  cve202676172MalformedSchemes.forEach((uri) => {
+    t.equal(fastURI.parse(uri).error, 'URI scheme is malformed.', `parse rejects ${uri}`)
+    t.equal(fastURI.normalize(uri), uri, `normalize preserves ${uri}`)
+    t.equal(fastURI.equal(uri, uri, {}), false, `equal refuses ${uri}`)
+  })
+})
+
+test('CVE-2026-76172: a decoded scheme selects the scheme handler that normalizes it', (t) => {
+  const validSchemes = [
+    ['a:value', 'a'],
+    ['HTTP://example.com/', 'http'],
+    ['a1+.-:value', 'a1+.-'],
+    ['%4Aavascript:alert(1)', 'javascript'],
+    ['foo%2Bbar:value', 'foo+bar'],
+    ['%u006Aavascript:1', 'javascript'],
+    ['ht%74ps://example.com/', 'https']
+  ]
+
+  t.plan(validSchemes.length * 2 + 1)
+
+  validSchemes.forEach(([uri, scheme]) => {
+    const parsed = fastURI.parse(uri)
+    t.equal(parsed.error, undefined, `${uri} parses`)
+    t.equal(parsed.scheme, scheme, `${uri} decodes to ${scheme}`)
+  })
+
+  // Before the fix the scheme was unescaped only *after* the handler lookup, so
+  // an encoded "https" skipped the https normalization while still emitting a
+  // string that reads as https.
+  t.equal(
+    fastURI.normalize('ht%74ps://example.com:443'),
+    'https://example.com/',
+    'the https handler runs after the scheme is decoded'
+  )
+})
+
+test('CVE-2026-76172: scheme normalization can not emit an authority or raw CRLF', (t) => {
+  const authority = '%2f%2fevil.example:/pwn'
+  const crlf = '%0d%0aSet-Cookie:%20sid=attacker:/p'
+
+  t.plan(4)
+
+  t.equal(fastURI.parse(authority).host, undefined, 'the input itself has no authority')
+  t.equal(fastURI.normalize(authority), authority, 'normalization does not create an authority')
+  t.equal(fastURI.normalize(crlf), crlf, 'normalization does not rewrite the scheme')
+  t.equal(fastURI.normalize(crlf).indexOf('\r\n'), -1, 'normalized output carries no raw CRLF')
+})
+
+test('CVE-2026-76172: component schemes are validated on every serialization path', (t) => {
+  t.plan(5)
+
+  t.equal(
+    fastURI.serialize({ scheme: 'foo%2Bbar', path: 'value' }),
+    'foo+bar:value',
+    'a component scheme that decodes to a valid scheme is serialized'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '//evil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'serialize rejects a raw invalid component scheme'
+  )
+  t.throws(
+    () => fastURI.normalize({ scheme: '%2f%2fevil.example', path: '/pwn' }),
+    /URI scheme is malformed/,
+    'normalize rejects an encoded invalid component scheme'
+  )
+  t.equal(
+    fastURI.equal(
+      { scheme: '%2f%2fevil.example', path: '/pwn' },
+      { scheme: '%2f%2fevil.example', path: '/pwn' },
+      {}
+    ),
+    false,
+    'equal fails closed for component objects that can not be serialized'
+  )
+  t.equal(
+    fastURI.equal({ scheme: 'ht%74p', host: 'example.com', path: '/' }, 'http://example.com/', {}),
+    true,
+    'a component scheme that decodes to http still compares equal'
+  )
+})
